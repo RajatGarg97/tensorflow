@@ -618,28 +618,8 @@ LogicalResult ReduceOp::fold(ArrayRef<Attribute> operands,
 //===----------------------------------------------------------------------===//
 
 static LogicalResult Verify(SelectOp op) {
-  auto onTrueType = op.on_true()->getType().cast<RankedTensorType>();
-  auto onFalseType = op.on_false()->getType().cast<RankedTensorType>();
-
-  if (onTrueType != onFalseType) {
-    return op.emitOpError(
-        llvm::formatv("on_true type ({0}) does not match on_false type ({1})",
-                      onTrueType, onFalseType));
-  }
-
-  auto predType = op.pred()->getType().cast<RankedTensorType>();
-  auto predShape = predType.getShape();
-  auto predRank = predType.getRank();
-  auto selectShape = onTrueType.getShape();
-
-  if (predRank != 0 && predShape != selectShape) {
-    return op.emitOpError(llvm::formatv(
-        "pred shape ([{0}]) is not scalar and does not match operand shapes "
-        "([{1}])",
-        llvm::make_range(predShape.begin(), predShape.end()),
-        llvm::make_range(selectShape.begin(), selectShape.end())));
-  }
-
+  // TODO(jpienaar): Update to allow broadcastable and unranked inputs. This
+  // corresponds to the client side HLO.
   return success();
 }
 
@@ -905,6 +885,38 @@ static LogicalResult Verify(TransposeOp op) {
   }
 
   return success();
+}
+
+//===----------------------------------------------------------------------===//
+// GetTupleElementOp
+//===----------------------------------------------------------------------===//
+
+void GetTupleElementOp::build(Builder* builder, OperationState& result,
+                              Value* tuple, int32_t index) {
+  if (auto tuple_type = tuple->getType().dyn_cast<TupleType>()) {
+    auto element_type = tuple_type.getType(index);
+    build(builder, result, element_type, tuple,
+          builder->getI32IntegerAttr(index));
+    return;
+  }
+
+  build(builder, result, tuple->getType(), tuple,
+        builder->getI32IntegerAttr(index));
+}
+
+//===----------------------------------------------------------------------===//
+// TupleOp
+//===----------------------------------------------------------------------===//
+
+void TupleOp::build(Builder* builder, OperationState& result,
+                    ArrayRef<Value*> values) {
+  SmallVector<Type, 4> types;
+  types.reserve(values.size());
+  for (auto val : values) {
+    types.push_back(val->getType());
+  }
+
+  build(builder, result, builder->getTupleType(types), values);
 }
 
 //===----------------------------------------------------------------------===//

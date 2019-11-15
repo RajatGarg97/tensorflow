@@ -306,6 +306,24 @@ void AssertOp::getCanonicalizationPatterns(OwningRewritePatternList &results,
 }
 
 //===----------------------------------------------------------------------===//
+// BatchMatMulOp
+//===----------------------------------------------------------------------===//
+
+void BatchMatMulOp::getCanonicalizationPatterns(
+    OwningRewritePatternList &results, MLIRContext *context) {
+  results.insert<BatchMatMulToMatMul>(context);
+}
+
+//===----------------------------------------------------------------------===//
+// BatchMatMulV2Op
+//===----------------------------------------------------------------------===//
+
+void BatchMatMulV2Op::getCanonicalizationPatterns(
+    OwningRewritePatternList &results, MLIRContext *context) {
+  results.insert<BatchMatMulV2ToMatMul>(context);
+}
+
+//===----------------------------------------------------------------------===//
 // BiasAddOp
 //===----------------------------------------------------------------------===//
 
@@ -739,6 +757,19 @@ static LogicalResult Verify(FakeQuantWithMinMaxVarsPerChannelOp op) {
     return op.emitOpError(
         "requires num_bits to be between 2 and 16, inclusive");
   }
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// FillOp
+//===----------------------------------------------------------------------===//
+
+static LogicalResult Verify(FillOp op) {
+  if (!IsOfRankOrUnranked(op.dims(), 1))
+    return op.emitOpError() << "requires dims to be a 1D tensor";
+  if (!IsOfRankOrUnranked(op.value(), 0))
+    return op.emitOpError() << "requires value to be a scalar";
+
   return success();
 }
 

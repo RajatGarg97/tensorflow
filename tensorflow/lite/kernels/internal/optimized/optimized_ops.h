@@ -5572,7 +5572,7 @@ inline void Quantize(int32_t multiplier, int32_t shift, int32_t total_size,
     const uint16x8_t result_1 =
         vcombine_u16(vqmovn_u32(vreinterpretq_u32_s32(temp_val.val[0])),
                      vqmovn_u32(vreinterpretq_u32_s32(temp_val.val[1])));
-    const int16x8_t result_2 =
+    const uint16x8_t result_2 =
         vcombine_u16(vqmovn_u32(vreinterpretq_u32_s32(temp_val.val[2])),
                      vqmovn_u32(vreinterpretq_u32_s32(temp_val.val[3])));
     const uint8x16_t result =
@@ -5633,41 +5633,30 @@ inline void TransposeConvV2(
   const int hwoi_ordered_filter_total_size =
       filter_height * filter_width * output_depth;
 
-  // TODO(b/144197699): Should use GEMM backend instead of using Ruy directly
-  // once GEMM backend supports query raw accumulators.
-  ruy::Matrix<uint8_t> ruy_lhs;
-  ruy_lhs.layout.rows = hwoi_ordered_filter_total_size;
-  ruy_lhs.layout.cols = input_depth;
-  ruy_lhs.layout.order = ruy::Order::kRowMajor;
-  ruy_lhs.layout.stride = input_depth;
-
-  ruy_lhs.data = hwoi_ordered_filter_data;
-  ruy_lhs.zero_point = -params.weights_offset;
+  cpu_backend_gemm::MatrixParams<uint8_t> lhs_params;
+  lhs_params.order = cpu_backend_gemm::Order::kRowMajor;
+  lhs_params.rows = hwoi_ordered_filter_total_size;
+  lhs_params.cols = input_depth;
+  lhs_params.zero_point = -params.weights_offset;
 
   int32_t* scratch_data_p = scratch_data;
   std::fill_n(scratch_data, output_offset * batch_size, static_cast<int32>(0));
   for (int i = 0; i < batch_size; ++i) {
-    ruy::Matrix<uint8_t> ruy_rhs;
-    ruy_rhs.layout.rows = input_depth;
-    ruy_rhs.layout.cols = input_image_size;
-    ruy_rhs.layout.order = ruy::Order::kColMajor;
-    ruy_rhs.layout.stride = input_depth;
+    cpu_backend_gemm::MatrixParams<uint8_t> rhs_params;
+    rhs_params.order = cpu_backend_gemm::Order::kColMajor;
+    rhs_params.rows = input_depth;
+    rhs_params.cols = input_image_size;
+    rhs_params.zero_point = -params.input_offset;
 
-    ruy_rhs.data = input_data + input_offset * i;
-    ruy_rhs.zero_point = -params.input_offset;
+    cpu_backend_gemm::MatrixParams<int32_t> dst_params;
+    dst_params.order = cpu_backend_gemm::Order::kColMajor;
+    dst_params.rows = hwoi_ordered_filter_total_size;
+    dst_params.cols = input_image_size;
 
-    ruy::Matrix<int32_t> ruy_dst;
-    ruy_dst.layout.rows = hwoi_ordered_filter_total_size;
-    ruy_dst.layout.cols = input_image_size;
-    ruy_dst.layout.order = ruy::Order::kColMajor;
-    ruy_dst.layout.stride = hwoi_ordered_filter_total_size;
-
-    ruy_dst.data = col2im_data;
-
-    ruy::BasicSpec<int32_t, int32_t> ruy_spec;
-
-    ruy::Mul<ruy::kAllPaths>(ruy_lhs, ruy_rhs, ruy_spec,
-                             cpu_backend_context->ruy_context(), &ruy_dst);
+    cpu_backend_gemm::GemmParams<int32_t, int32_t> gemm_params;
+    cpu_backend_gemm::Gemm(lhs_params, hwoi_ordered_filter_data, rhs_params,
+                           input_data + input_offset * i, dst_params,
+                           col2im_data, gemm_params, cpu_backend_context);
 
     Col2im(col2im_data, output_depth, output_height, output_width,
            filter_height, filter_width, padding_top, padding_left,
@@ -5762,117 +5751,6 @@ inline void Requantize(const input_type* input_data, int32_t size,
                             output_zeropoint, output_data);
 }
 
-#ifdef USE_NEON
-
-// TODO(jaesung): Merge duplicated implementations in optimized_ops.h and
-// neon_tensor_utils.cc.
-inline void MultiplyByQuantizedMultiplier4Rows(
-    const int32x4_t input_val_1, const int32x4_t input_val_2,
-    const int32x4_t input_val_3, const int32x4_t input_val_4,
-    const int32_t multiplier, const int32_t left_shifted_one,
-    const int32_t right_shift, int32x4_t* result_val_1, int32x4_t* result_val_2,
-    int32x4_t* result_val_3, int32x4_t* result_val_4) {
-  using gemmlowp::RoundingDivideByPOT;
-  using gemmlowp::SaturatingRoundingDoublingHighMul;
-
-// The vector type support for SaturatingRoundingDoublingHighMulth in gemmlowp
-// is limited to NEON.
-#ifdef GEMMLOWP_NEON
-  int32x4_t left_shifted_one_dup = vdupq_n_s32(left_shifted_one);
-  *result_val_1 = RoundingDivideByPOT(
-      SaturatingRoundingDoublingHighMul(
-          vmulq_s32(input_val_1, left_shifted_one_dup), multiplier),
-      right_shift);
-  *result_val_2 = RoundingDivideByPOT(
-      SaturatingRoundingDoublingHighMul(
-          vmulq_s32(input_val_2, left_shifted_one_dup), multiplier),
-      right_shift);
-  *result_val_3 = RoundingDivideByPOT(
-      SaturatingRoundingDoublingHighMul(
-          vmulq_s32(input_val_3, left_shifted_one_dup), multiplier),
-      right_shift);
-  *result_val_4 = RoundingDivideByPOT(
-      SaturatingRoundingDoublingHighMul(
-          vmulq_s32(input_val_4, left_shifted_one_dup), multiplier),
-      right_shift);
-#else
-  int32_t vals[4];
-  vals[0] = RoundingDivideByPOT(
-      SaturatingRoundingDoublingHighMul(
-          vgetq_lane_s32(input_val_1, 0) * left_shifted_one, multiplier),
-      right_shift);
-  vals[1] = RoundingDivideByPOT(
-      SaturatingRoundingDoublingHighMul(
-          vgetq_lane_s32(input_val_1, 1) * left_shifted_one, multiplier),
-      right_shift);
-  vals[2] = RoundingDivideByPOT(
-      SaturatingRoundingDoublingHighMul(
-          vgetq_lane_s32(input_val_1, 2) * left_shifted_one, multiplier),
-      right_shift);
-  vals[3] = RoundingDivideByPOT(
-      SaturatingRoundingDoublingHighMul(
-          vgetq_lane_s32(input_val_1, 3) * left_shifted_one, multiplier),
-      right_shift);
-  *result_val_1 = vld1q_s32(reinterpret_cast<int32_t*>(&vals));
-
-  vals[0] = RoundingDivideByPOT(
-      SaturatingRoundingDoublingHighMul(
-          vgetq_lane_s32(input_val_2, 0) * left_shifted_one, multiplier),
-      right_shift);
-  vals[1] = RoundingDivideByPOT(
-      SaturatingRoundingDoublingHighMul(
-          vgetq_lane_s32(input_val_2, 1) * left_shifted_one, multiplier),
-      right_shift);
-  vals[2] = RoundingDivideByPOT(
-      SaturatingRoundingDoublingHighMul(
-          vgetq_lane_s32(input_val_2, 2) * left_shifted_one, multiplier),
-      right_shift);
-  vals[3] = RoundingDivideByPOT(
-      SaturatingRoundingDoublingHighMul(
-          vgetq_lane_s32(input_val_2, 3) * left_shifted_one, multiplier),
-      right_shift);
-  *result_val_2 = vld1q_s32(reinterpret_cast<int32_t*>(&vals));
-
-  vals[0] = RoundingDivideByPOT(
-      SaturatingRoundingDoublingHighMul(
-          vgetq_lane_s32(input_val_3, 0) * left_shifted_one, multiplier),
-      right_shift);
-  vals[1] = RoundingDivideByPOT(
-      SaturatingRoundingDoublingHighMul(
-          vgetq_lane_s32(input_val_3, 1) * left_shifted_one, multiplier),
-      right_shift);
-  vals[2] = RoundingDivideByPOT(
-      SaturatingRoundingDoublingHighMul(
-          vgetq_lane_s32(input_val_3, 2) * left_shifted_one, multiplier),
-      right_shift);
-  vals[3] = RoundingDivideByPOT(
-      SaturatingRoundingDoublingHighMul(
-          vgetq_lane_s32(input_val_3, 3) * left_shifted_one, multiplier),
-      right_shift);
-  *result_val_3 = vld1q_s32(reinterpret_cast<int32_t*>(&vals));
-
-  vals[0] = RoundingDivideByPOT(
-      SaturatingRoundingDoublingHighMul(
-          vgetq_lane_s32(input_val_4, 0) * left_shifted_one, multiplier),
-      right_shift);
-  vals[1] = RoundingDivideByPOT(
-      SaturatingRoundingDoublingHighMul(
-          vgetq_lane_s32(input_val_4, 1) * left_shifted_one, multiplier),
-      right_shift);
-  vals[2] = RoundingDivideByPOT(
-      SaturatingRoundingDoublingHighMul(
-          vgetq_lane_s32(input_val_4, 2) * left_shifted_one, multiplier),
-      right_shift);
-  vals[3] = RoundingDivideByPOT(
-      SaturatingRoundingDoublingHighMul(
-          vgetq_lane_s32(input_val_4, 3) * left_shifted_one, multiplier),
-      right_shift);
-  *result_val_4 = vld1q_s32(reinterpret_cast<int32_t*>(&vals));
-#endif
-}
-
-#endif
-
 template <>
 inline void Requantize<int8_t, uint8_t>(const int8_t* input_data, int32_t size,
                                         int32_t effective_scale_multiplier,
@@ -5893,48 +5771,44 @@ inline void Requantize<int8_t, uint8_t>(const int8_t* input_data, int32_t size,
   const int32x4_t min_val_dup = vdupq_n_s32(kMinOutput);
   const int32x4_t max_val_dup = vdupq_n_s32(kMaxOutput);
 
-  // Left shift & right shift unconditionally.
-  const int32_t left_shifted_one =
-      effective_scale_shift > 0 ? 1 << effective_scale_shift : 1;
-  const int32_t right_shift =
-      effective_scale_shift > 0 ? 0 : -effective_scale_shift;
-
   for (; i <= size - 16; i += 16) {
     const int8x16_t input_vec = vld1q_s8(input_data + i);
     const int16x8_t first_half = vmovl_s8(vget_low_s8(input_vec));
     const int16x8_t second_half = vmovl_s8(vget_high_s8(input_vec));
-    int32x4_t input_val_1 = vmovl_s16(vget_low_s16(first_half));
-    int32x4_t input_val_2 = vmovl_s16(vget_high_s16(first_half));
-    int32x4_t input_val_3 = vmovl_s16(vget_low_s16(second_half));
-    int32x4_t input_val_4 = vmovl_s16(vget_high_s16(second_half));
-    input_val_1 = vaddq_s32(input_val_1, input_zero_point_dup);
-    input_val_2 = vaddq_s32(input_val_2, input_zero_point_dup);
-    input_val_3 = vaddq_s32(input_val_3, input_zero_point_dup);
-    input_val_4 = vaddq_s32(input_val_4, input_zero_point_dup);
+    int32x4x4_t input;
+    input.val[0] = vmovl_s16(vget_low_s16(first_half));
+    input.val[1] = vmovl_s16(vget_high_s16(first_half));
+    input.val[2] = vmovl_s16(vget_low_s16(second_half));
+    input.val[3] = vmovl_s16(vget_high_s16(second_half));
+    input.val[0] = vaddq_s32(input.val[0], input_zero_point_dup);
+    input.val[1] = vaddq_s32(input.val[1], input_zero_point_dup);
+    input.val[2] = vaddq_s32(input.val[2], input_zero_point_dup);
+    input.val[3] = vaddq_s32(input.val[3], input_zero_point_dup);
 
-    int32x4_t result_val_1, result_val_2, result_val_3, result_val_4;
-    MultiplyByQuantizedMultiplier4Rows(
-        input_val_1, input_val_2, input_val_3, input_val_4,
-        effective_scale_multiplier, left_shifted_one, right_shift,
-        &result_val_1, &result_val_2, &result_val_3, &result_val_4);
+    int32x4x4_t result = MultiplyByQuantizedMultiplier4Rows(
+        input, effective_scale_multiplier, effective_scale_shift);
 
-    result_val_1 = vaddq_s32(result_val_1, output_zero_point_dup);
-    result_val_2 = vaddq_s32(result_val_2, output_zero_point_dup);
-    result_val_3 = vaddq_s32(result_val_3, output_zero_point_dup);
-    result_val_4 = vaddq_s32(result_val_4, output_zero_point_dup);
-    result_val_1 = vmaxq_s32(vminq_s32(result_val_1, max_val_dup), min_val_dup);
-    result_val_2 = vmaxq_s32(vminq_s32(result_val_2, max_val_dup), min_val_dup);
-    result_val_3 = vmaxq_s32(vminq_s32(result_val_3, max_val_dup), min_val_dup);
-    result_val_4 = vmaxq_s32(vminq_s32(result_val_4, max_val_dup), min_val_dup);
+    result.val[0] = vaddq_s32(result.val[0], output_zero_point_dup);
+    result.val[1] = vaddq_s32(result.val[1], output_zero_point_dup);
+    result.val[2] = vaddq_s32(result.val[2], output_zero_point_dup);
+    result.val[3] = vaddq_s32(result.val[3], output_zero_point_dup);
+    result.val[0] =
+        vmaxq_s32(vminq_s32(result.val[0], max_val_dup), min_val_dup);
+    result.val[1] =
+        vmaxq_s32(vminq_s32(result.val[1], max_val_dup), min_val_dup);
+    result.val[2] =
+        vmaxq_s32(vminq_s32(result.val[2], max_val_dup), min_val_dup);
+    result.val[3] =
+        vmaxq_s32(vminq_s32(result.val[3], max_val_dup), min_val_dup);
 
     const uint32x4_t result_val_1_unsigned =
-        vreinterpretq_u32_s32(result_val_1);
+        vreinterpretq_u32_s32(result.val[0]);
     const uint32x4_t result_val_2_unsigned =
-        vreinterpretq_u32_s32(result_val_2);
+        vreinterpretq_u32_s32(result.val[1]);
     const uint32x4_t result_val_3_unsigned =
-        vreinterpretq_u32_s32(result_val_3);
+        vreinterpretq_u32_s32(result.val[2]);
     const uint32x4_t result_val_4_unsigned =
-        vreinterpretq_u32_s32(result_val_4);
+        vreinterpretq_u32_s32(result.val[3]);
 
     const uint16x4_t narrowed_val_1 = vqmovn_u32(result_val_1_unsigned);
     const uint16x4_t narrowed_val_2 = vqmovn_u32(result_val_2_unsigned);
@@ -5946,9 +5820,9 @@ inline void Requantize<int8_t, uint8_t>(const int8_t* input_data, int32_t size,
         vcombine_u16(narrowed_val_3, narrowed_val_4);
     const uint8x8_t narrowed_first_half = vqmovn_u16(output_first_half);
     const uint8x8_t narrowed_second_half = vqmovn_u16(output_second_half);
-    const uint8x16_t result =
+    const uint8x16_t narrowed_result =
         vcombine_u8(narrowed_first_half, narrowed_second_half);
-    vst1q_u8(output_data + i, result);
+    vst1q_u8(output_data + i, narrowed_result);
   }
 
 #endif
@@ -5984,57 +5858,49 @@ inline void Requantize<uint8_t, int8_t>(const uint8_t* input_data, int32_t size,
   const int32x4_t min_val_dup = vdupq_n_s32(kMinOutput);
   const int32x4_t max_val_dup = vdupq_n_s32(kMaxOutput);
 
-  // Left shift & right shift unconditionally.
-  const int32_t left_shifted_one =
-      effective_scale_shift > 0 ? 1 << effective_scale_shift : 1;
-  const int32_t right_shift =
-      effective_scale_shift > 0 ? 0 : -effective_scale_shift;
-
   for (; i <= size - 16; i += 16) {
     const uint8x16_t input_vec = vld1q_u8(input_data + i);
     const uint16x8_t first_half = vmovl_u8(vget_low_u8(input_vec));
     const uint16x8_t second_half = vmovl_u8(vget_high_u8(input_vec));
-    int32x4_t input_val_1 =
-        vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(first_half)));
-    int32x4_t input_val_2 =
-        vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(first_half)));
-    int32x4_t input_val_3 =
-        vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(second_half)));
-    int32x4_t input_val_4 =
-        vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(second_half)));
-    input_val_1 = vaddq_s32(input_val_1, input_zero_point_dup);
-    input_val_2 = vaddq_s32(input_val_2, input_zero_point_dup);
-    input_val_3 = vaddq_s32(input_val_3, input_zero_point_dup);
-    input_val_4 = vaddq_s32(input_val_4, input_zero_point_dup);
+    int32x4x4_t input;
+    input.val[0] = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(first_half)));
+    input.val[1] = vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(first_half)));
+    input.val[2] = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(second_half)));
+    input.val[3] = vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(second_half)));
+    input.val[0] = vaddq_s32(input.val[0], input_zero_point_dup);
+    input.val[1] = vaddq_s32(input.val[1], input_zero_point_dup);
+    input.val[2] = vaddq_s32(input.val[2], input_zero_point_dup);
+    input.val[3] = vaddq_s32(input.val[3], input_zero_point_dup);
 
-    int32x4_t result_val_1, result_val_2, result_val_3, result_val_4;
-    MultiplyByQuantizedMultiplier4Rows(
-        input_val_1, input_val_2, input_val_3, input_val_4,
-        effective_scale_multiplier, left_shifted_one, right_shift,
-        &result_val_1, &result_val_2, &result_val_3, &result_val_4);
+    int32x4x4_t result = MultiplyByQuantizedMultiplier4Rows(
+        input, effective_scale_multiplier, effective_scale_shift);
 
-    result_val_1 = vaddq_s32(result_val_1, output_zero_point_dup);
-    result_val_2 = vaddq_s32(result_val_2, output_zero_point_dup);
-    result_val_3 = vaddq_s32(result_val_3, output_zero_point_dup);
-    result_val_4 = vaddq_s32(result_val_4, output_zero_point_dup);
-    result_val_1 = vmaxq_s32(vminq_s32(result_val_1, max_val_dup), min_val_dup);
-    result_val_2 = vmaxq_s32(vminq_s32(result_val_2, max_val_dup), min_val_dup);
-    result_val_3 = vmaxq_s32(vminq_s32(result_val_3, max_val_dup), min_val_dup);
-    result_val_4 = vmaxq_s32(vminq_s32(result_val_4, max_val_dup), min_val_dup);
+    result.val[0] = vaddq_s32(result.val[0], output_zero_point_dup);
+    result.val[1] = vaddq_s32(result.val[1], output_zero_point_dup);
+    result.val[2] = vaddq_s32(result.val[2], output_zero_point_dup);
+    result.val[3] = vaddq_s32(result.val[3], output_zero_point_dup);
+    result.val[0] =
+        vmaxq_s32(vminq_s32(result.val[0], max_val_dup), min_val_dup);
+    result.val[1] =
+        vmaxq_s32(vminq_s32(result.val[1], max_val_dup), min_val_dup);
+    result.val[2] =
+        vmaxq_s32(vminq_s32(result.val[2], max_val_dup), min_val_dup);
+    result.val[3] =
+        vmaxq_s32(vminq_s32(result.val[3], max_val_dup), min_val_dup);
 
-    const int16x4_t narrowed_val_1 = vqmovn_s32(result_val_1);
-    const int16x4_t narrowed_val_2 = vqmovn_s32(result_val_2);
-    const int16x4_t narrowed_val_3 = vqmovn_s32(result_val_3);
-    const int16x4_t narrowed_val_4 = vqmovn_s32(result_val_4);
+    const int16x4_t narrowed_val_1 = vqmovn_s32(result.val[0]);
+    const int16x4_t narrowed_val_2 = vqmovn_s32(result.val[1]);
+    const int16x4_t narrowed_val_3 = vqmovn_s32(result.val[2]);
+    const int16x4_t narrowed_val_4 = vqmovn_s32(result.val[3]);
     const int16x8_t output_first_half =
         vcombine_s16(narrowed_val_1, narrowed_val_2);
     const int16x8_t output_second_half =
         vcombine_s16(narrowed_val_3, narrowed_val_4);
     const int8x8_t narrowed_first_half = vqmovn_s16(output_first_half);
     const int8x8_t narrowed_second_half = vqmovn_s16(output_second_half);
-    const int8x16_t result =
+    const int8x16_t narrowed_result =
         vcombine_s8(narrowed_first_half, narrowed_second_half);
-    vst1q_s8(output_data + i, result);
+    vst1q_s8(output_data + i, narrowed_result);
   }
 
 #endif
@@ -6070,53 +5936,50 @@ inline void Requantize<int8_t, int8_t>(const int8_t* input_data, int32_t size,
   const int32x4_t min_val_dup = vdupq_n_s32(kMinOutput);
   const int32x4_t max_val_dup = vdupq_n_s32(kMaxOutput);
 
-  // Left shift & right shift unconditionally.
-  int32_t left_shifted_one =
-      effective_scale_shift > 0 ? 1 << effective_scale_shift : 1;
-  int32_t right_shift = effective_scale_shift > 0 ? 0 : -effective_scale_shift;
-
   for (; i <= size - 16; i += 16) {
     const int8x16_t input_vec = vld1q_s8(input_data + i);
     const int16x8_t first_half = vmovl_s8(vget_low_s8(input_vec));
     const int16x8_t second_half = vmovl_s8(vget_high_s8(input_vec));
-    int32x4_t input_val_1 = vmovl_s16(vget_low_s16(first_half));
-    int32x4_t input_val_2 = vmovl_s16(vget_high_s16(first_half));
-    int32x4_t input_val_3 = vmovl_s16(vget_low_s16(second_half));
-    int32x4_t input_val_4 = vmovl_s16(vget_high_s16(second_half));
+    int32x4x4_t input;
+    input.val[0] = vmovl_s16(vget_low_s16(first_half));
+    input.val[1] = vmovl_s16(vget_high_s16(first_half));
+    input.val[2] = vmovl_s16(vget_low_s16(second_half));
+    input.val[3] = vmovl_s16(vget_high_s16(second_half));
 
-    input_val_1 = vaddq_s32(input_val_1, input_zero_point_dup);
-    input_val_2 = vaddq_s32(input_val_2, input_zero_point_dup);
-    input_val_3 = vaddq_s32(input_val_3, input_zero_point_dup);
-    input_val_4 = vaddq_s32(input_val_4, input_zero_point_dup);
+    input.val[0] = vaddq_s32(input.val[0], input_zero_point_dup);
+    input.val[1] = vaddq_s32(input.val[1], input_zero_point_dup);
+    input.val[2] = vaddq_s32(input.val[2], input_zero_point_dup);
+    input.val[3] = vaddq_s32(input.val[3], input_zero_point_dup);
 
-    int32x4_t result_val_1, result_val_2, result_val_3, result_val_4;
-    MultiplyByQuantizedMultiplier4Rows(
-        input_val_1, input_val_2, input_val_3, input_val_4,
-        effective_scale_multiplier, left_shifted_one, right_shift,
-        &result_val_1, &result_val_2, &result_val_3, &result_val_4);
+    int32x4x4_t result = MultiplyByQuantizedMultiplier4Rows(
+        input, effective_scale_multiplier, effective_scale_shift);
 
-    result_val_1 = vaddq_s32(result_val_1, output_zero_point_dup);
-    result_val_2 = vaddq_s32(result_val_2, output_zero_point_dup);
-    result_val_3 = vaddq_s32(result_val_3, output_zero_point_dup);
-    result_val_4 = vaddq_s32(result_val_4, output_zero_point_dup);
-    result_val_1 = vmaxq_s32(vminq_s32(result_val_1, max_val_dup), min_val_dup);
-    result_val_2 = vmaxq_s32(vminq_s32(result_val_2, max_val_dup), min_val_dup);
-    result_val_3 = vmaxq_s32(vminq_s32(result_val_3, max_val_dup), min_val_dup);
-    result_val_4 = vmaxq_s32(vminq_s32(result_val_4, max_val_dup), min_val_dup);
+    result.val[0] = vaddq_s32(result.val[0], output_zero_point_dup);
+    result.val[1] = vaddq_s32(result.val[1], output_zero_point_dup);
+    result.val[2] = vaddq_s32(result.val[2], output_zero_point_dup);
+    result.val[3] = vaddq_s32(result.val[3], output_zero_point_dup);
+    result.val[0] =
+        vmaxq_s32(vminq_s32(result.val[0], max_val_dup), min_val_dup);
+    result.val[1] =
+        vmaxq_s32(vminq_s32(result.val[1], max_val_dup), min_val_dup);
+    result.val[2] =
+        vmaxq_s32(vminq_s32(result.val[2], max_val_dup), min_val_dup);
+    result.val[3] =
+        vmaxq_s32(vminq_s32(result.val[3], max_val_dup), min_val_dup);
 
-    const int16x4_t narrowed_val_1 = vqmovn_s32(result_val_1);
-    const int16x4_t narrowed_val_2 = vqmovn_s32(result_val_2);
-    const int16x4_t narrowed_val_3 = vqmovn_s32(result_val_3);
-    const int16x4_t narrowed_val_4 = vqmovn_s32(result_val_4);
+    const int16x4_t narrowed_val_1 = vqmovn_s32(result.val[0]);
+    const int16x4_t narrowed_val_2 = vqmovn_s32(result.val[1]);
+    const int16x4_t narrowed_val_3 = vqmovn_s32(result.val[2]);
+    const int16x4_t narrowed_val_4 = vqmovn_s32(result.val[3]);
     const int16x8_t output_first_half =
         vcombine_s16(narrowed_val_1, narrowed_val_2);
     const int16x8_t output_second_half =
         vcombine_s16(narrowed_val_3, narrowed_val_4);
     const int8x8_t narrowed_first_half = vqmovn_s16(output_first_half);
     const int8x8_t narrowed_second_half = vqmovn_s16(output_second_half);
-    const int8x16_t result =
+    const int8x16_t narrowed_result =
         vcombine_s8(narrowed_first_half, narrowed_second_half);
-    vst1q_s8(output_data + i, result);
+    vst1q_s8(output_data + i, narrowed_result);
   }
 
 #endif
@@ -6150,51 +6013,44 @@ inline void Requantize<uint8_t, uint8_t>(
   const int32x4_t min_val_dup = vdupq_n_s32(kMinOutput);
   const int32x4_t max_val_dup = vdupq_n_s32(kMaxOutput);
 
-  // Left shift & right shift unconditionally.
-  int32_t left_shifted_one =
-      effective_scale_shift > 0 ? 1 << effective_scale_shift : 1;
-  int32_t right_shift = effective_scale_shift > 0 ? 0 : -effective_scale_shift;
-
   for (; i <= size - 16; i += 16) {
     const uint8x16_t input_vec = vld1q_u8(input_data + i);
     const uint16x8_t first_half = vmovl_u8(vget_low_u8(input_vec));
     const uint16x8_t second_half = vmovl_u8(vget_high_u8(input_vec));
-    int32x4_t input_val_1 =
-        vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(first_half)));
-    int32x4_t input_val_2 =
-        vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(first_half)));
-    int32x4_t input_val_3 =
-        vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(second_half)));
-    int32x4_t input_val_4 =
-        vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(second_half)));
-    input_val_1 = vaddq_s32(input_val_1, input_zero_point_dup);
-    input_val_2 = vaddq_s32(input_val_2, input_zero_point_dup);
-    input_val_3 = vaddq_s32(input_val_3, input_zero_point_dup);
-    input_val_4 = vaddq_s32(input_val_4, input_zero_point_dup);
+    int32x4x4_t input;
+    input.val[0] = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(first_half)));
+    input.val[1] = vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(first_half)));
+    input.val[2] = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(second_half)));
+    input.val[3] = vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(second_half)));
+    input.val[0] = vaddq_s32(input.val[0], input_zero_point_dup);
+    input.val[1] = vaddq_s32(input.val[1], input_zero_point_dup);
+    input.val[2] = vaddq_s32(input.val[2], input_zero_point_dup);
+    input.val[3] = vaddq_s32(input.val[3], input_zero_point_dup);
 
-    int32x4_t result_val_1, result_val_2, result_val_3, result_val_4;
-    MultiplyByQuantizedMultiplier4Rows(
-        input_val_1, input_val_2, input_val_3, input_val_4,
-        effective_scale_multiplier, left_shifted_one, right_shift,
-        &result_val_1, &result_val_2, &result_val_3, &result_val_4);
+    int32x4x4_t result = MultiplyByQuantizedMultiplier4Rows(
+        input, effective_scale_multiplier, effective_scale_shift);
 
-    result_val_1 = vaddq_s32(result_val_1, output_zero_point_dup);
-    result_val_2 = vaddq_s32(result_val_2, output_zero_point_dup);
-    result_val_3 = vaddq_s32(result_val_3, output_zero_point_dup);
-    result_val_4 = vaddq_s32(result_val_4, output_zero_point_dup);
-    result_val_1 = vmaxq_s32(vminq_s32(result_val_1, max_val_dup), min_val_dup);
-    result_val_2 = vmaxq_s32(vminq_s32(result_val_2, max_val_dup), min_val_dup);
-    result_val_3 = vmaxq_s32(vminq_s32(result_val_3, max_val_dup), min_val_dup);
-    result_val_4 = vmaxq_s32(vminq_s32(result_val_4, max_val_dup), min_val_dup);
+    result.val[0] = vaddq_s32(result.val[0], output_zero_point_dup);
+    result.val[1] = vaddq_s32(result.val[1], output_zero_point_dup);
+    result.val[2] = vaddq_s32(result.val[2], output_zero_point_dup);
+    result.val[3] = vaddq_s32(result.val[3], output_zero_point_dup);
+    result.val[0] =
+        vmaxq_s32(vminq_s32(result.val[0], max_val_dup), min_val_dup);
+    result.val[1] =
+        vmaxq_s32(vminq_s32(result.val[1], max_val_dup), min_val_dup);
+    result.val[2] =
+        vmaxq_s32(vminq_s32(result.val[2], max_val_dup), min_val_dup);
+    result.val[3] =
+        vmaxq_s32(vminq_s32(result.val[3], max_val_dup), min_val_dup);
 
     const uint32x4_t result_val_1_unsigned =
-        vreinterpretq_u32_s32(result_val_1);
+        vreinterpretq_u32_s32(result.val[0]);
     const uint32x4_t result_val_2_unsigned =
-        vreinterpretq_u32_s32(result_val_2);
+        vreinterpretq_u32_s32(result.val[1]);
     const uint32x4_t result_val_3_unsigned =
-        vreinterpretq_u32_s32(result_val_3);
+        vreinterpretq_u32_s32(result.val[2]);
     const uint32x4_t result_val_4_unsigned =
-        vreinterpretq_u32_s32(result_val_4);
+        vreinterpretq_u32_s32(result.val[3]);
 
     const uint16x4_t narrowed_val_1 = vqmovn_u32(result_val_1_unsigned);
     const uint16x4_t narrowed_val_2 = vqmovn_u32(result_val_2_unsigned);
@@ -6206,9 +6062,9 @@ inline void Requantize<uint8_t, uint8_t>(
         vcombine_u16(narrowed_val_3, narrowed_val_4);
     const uint8x8_t narrowed_first_half = vqmovn_u16(output_first_half);
     const uint8x8_t narrowed_second_half = vqmovn_u16(output_second_half);
-    const uint8x16_t result =
+    const uint8x16_t narrowed_result =
         vcombine_u8(narrowed_first_half, narrowed_second_half);
-    vst1q_u8(output_data + i, result);
+    vst1q_u8(output_data + i, narrowed_result);
   }
 
 #endif
